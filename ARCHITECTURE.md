@@ -1,7 +1,7 @@
 # RxScope — Pre-Build Architecture Document
 
-**Version:** 0.1.1-draft  
-**Date:** April 5, 2026  
+**Version:** 0.2.0-draft  
+**Date:** April 6, 2026  
 **Author:** Architecture Review  
 **Client:** RxNetwork  
 **Classification:** Confidential (Post-NDA)
@@ -28,6 +28,10 @@
 8. [Open Questions for Decision](#8-open-questions-for-decision)
 9. [Cloudflare Workers — What They Are & How They Fit](#9-cloudflare-workers)
 10. [Timeline Estimate](#10-timeline-estimate)
+11. [Technology Stack Decisions](#11-technology-stack-decisions)
+12. [Admin Dashboard Specification](#12-admin-dashboard-specification)
+13. [Infrastructure & Cost Breakdown](#13-infrastructure--cost-breakdown)
+14. [Client Communication Guide](#14-client-communication-guide)
 
 ---
 
@@ -366,9 +370,9 @@ Redis is NOT a database here. Use it for:
 
 1. **No gold-standard evaluation dataset.** You cannot measure classifier quality without one. You need labeled data BEFORE building the pipeline.
 
-2. **No advertiser integration specification.** How does the whitelist reach DSPs? Prebid? Custom deal IDs? A segment API? The output format and delivery mechanism determines whether anyone can actually USE the whitelist.
+2. **~~No advertiser integration specification.~~** **RESOLVED:** Client email explicitly specifies CSV/XLSX output with metadata columns (see Section 2.3). Remaining question: delivery cadence and channel.
 
-3. **No content access strategy.** Scraping Scribd at scale without a data deal is a legal landmine. This is an existential risk.
+3. **No content access strategy.** Scraping Scribd at scale without a data deal is a legal landmine. This is an existential risk. **NOTE:** Client says "including but not limited to" Scribd/Slideshare — this gives flexibility to start with legally clean platforms (PubMed, open-access journals) and add Scribd later.
 
 4. **No incremental processing strategy.** Processing 50M URLs from scratch takes weeks. You need an incremental pipeline that processes new/changed content and doesn't re-process stable URLs.
 
@@ -531,13 +535,65 @@ Redis is NOT a database here. Use it for:
 | Scraping Engine | Fetch page content, handle JS rendering, obey robots.txt. **Lightpanda** (Zig-based, 27k+ stars, CDP-compatible, 9x less memory & 11x faster than Chrome, `--obey-robots` built-in, Docker image available, AGPL-3.0). Playwright+Chrome fallback for edge cases. | Lightpanda (primary), Playwright (fallback) |
 | Proxy Pool | Rotate residential IPs, avoid rate limits | BrightData / Oxylabs API |
 | LangGraph Pipeline | Multi-agent content classification pipeline | LangGraph + Claude API |
-| PostgreSQL | Relational data + vector embeddings | PostgreSQL 16 + pgvector 0.8.2 |
-| Redis | Job queues, caching, rate limiting | Redis 7+ |
-| Object Storage | Raw content archival | Cloudflare R2 or AWS S3 |
-| Whitelist API | Serve classified URLs to ad-tech buyers | FastAPI or Cloudflare Workers |
+| PostgreSQL | Relational data + vector embeddings | **Supabase Pro** (PostgreSQL 16 + pgvector), Mumbai region |
+| Redis | Job queues, caching, rate limiting | Redis 7+ (Upstash) |
+| Object Storage | Raw content archival | Cloudflare R2 (zero egress) |
+| Whitelist API | Serve classified URLs to ad-tech buyers | Cloudflare Workers + Hyperdrive |
+| Admin Dashboard | Client-facing monitoring, export, and review panel | Next.js on Cloudflare Pages |
 | **CSV/XLSX Exporter** | **Primary delivery: Excel-compatible export per client spec** | **Python (openpyxl / pandas)** |
-| HITL Dashboard | Review low-confidence classifications | React/Next.js |
+| HITL Dashboard | Review low-confidence classifications | Next.js (integrated into Admin Dashboard) |
 | Re-scrape Scheduler | Periodic re-validation of classified URLs | pg_cron or APScheduler |
+| Monitoring & Observability | Trace pipeline execution, debug, evaluate | **LangSmith** (see Section 11) |
+
+### 2.2.1 Lightpanda — Primary Scraping Engine (Deep Dive)
+
+[Lightpanda](https://github.com/lightpanda-io/browser) is the open-source headless browser built from scratch for AI agents and automation. **Not a Chromium fork.** Written in Zig, purpose-built for headless workloads.
+
+| Property | Details |
+|----------|---------|
+| **GitHub** | 27.2k+ stars, 40+ contributors, active (daily commits) |
+| **Status** | Beta — many websites work; coverage improving |
+| **Language** | Zig (74.6%), with V8 for JS execution, html5ever for HTML parsing, libcurl for HTTP |
+| **License** | AGPL-3.0 |
+| **Performance** | 9x less memory than Chrome (24MB vs 207MB), 11x faster execution (2.3s vs 25.2s per 100 pages) |
+| **Protocol** | CDP (Chrome DevTools Protocol) — compatible with Puppeteer, Playwright, chromedp |
+| **Key flag** | `--obey-robots` — built-in robots.txt compliance |
+| **Docker** | `docker run -d --name lightpanda -p 9222:9222 lightpanda/browser:nightly` |
+| **Cloud** | Hosted offering at `cloud.lightpanda.io` (optional, not required) |
+| **Supported features** | CORS, HTTP loading, HTML parsing, DOM APIs, JS (V8), Ajax/XHR/Fetch, Click, Forms, Cookies, Custom headers, Proxy support, Network interception |
+| **Install** | `curl -fsSL https://pkg.lightpanda.io/install.sh \| bash` |
+
+**Why Lightpanda for RxScope:**
+1. **Cost:** At 10-50M URLs, Chrome instances eat RAM/CPU. Lightpanda uses 16x less memory = more concurrent scrapes per machine.
+2. **Speed:** 11x faster per page = 10-50M URLs processed significantly faster.
+3. **`--obey-robots`:** Built-in legal compliance flag, critical for RxScope's risk posture.
+4. **CDP compatible:** Drop-in replacement for Chrome. Same Puppeteer/Playwright scripts work.
+5. **No rendering overhead:** Headless-only, no GPU/display needed = cheaper cloud instances.
+
+**Integration pattern:**
+```javascript
+import puppeteer from 'puppeteer-core';
+
+// Connect to Lightpanda CDP server running on port 9222
+const browser = await puppeteer.connect({
+  browserWSEndpoint: "ws://127.0.0.1:9222",
+});
+
+const context = await browser.createBrowserContext();
+const page = await context.newPage();
+
+await page.goto('https://www.scribd.com/document/12345', { waitUntil: "networkidle0" });
+
+// Extract document text, metadata, author info
+const content = await page.evaluate(() => document.body.innerText);
+const title = await page.evaluate(() => document.title);
+
+await page.close();
+await context.close();
+await browser.disconnect();
+```
+
+**Fallback:** If Lightpanda fails (Beta limitations on JS-heavy pages), retry with Playwright + headless Chrome. Expect fallback rate to decrease as Lightpanda matures.
 
 ## 2.3 Output Specification (Per Client Requirements)
 
@@ -1233,16 +1289,27 @@ CREATE TABLE icd10_codes (
 ## 4.2 Key Queries the Schema Supports
 
 ```sql
--- 1. Get whitelist entries for a DSP export
-SELECT u.url, c.hcp_confidence, c.overall_confidence, c.audience_type,
-       c.source_type, c.attribution_entity,
-       array_agg(DISTINCT t.code) FILTER (WHERE t.taxonomy_system = 'iab') AS iab_codes,
-       array_agg(DISTINCT t.code) FILTER (WHERE t.taxonomy_system = 'mesh') AS mesh_codes
+-- 1. Get whitelist entries for CSV/XLSX export (matches RxNetwork client output spec)
+SELECT 
+    u.url,
+    split_part(u.url, '/', 3) AS source_domain,
+    u.document_type AS content_type,
+    string_agg(DISTINCT t.code, '; ') FILTER (WHERE t.taxonomy_system IN ('mesh', 'iab')) AS detected_medical_categories,
+    c.attribution_entity AS detected_entity_associations,
+    c.overall_confidence AS confidence_score,
+    -- Extended columns (optional per client)
+    c.audience_type,
+    c.source_type,
+    array_agg(DISTINCT t.code) FILTER (WHERE t.taxonomy_system = 'iab') AS iab_category_codes,
+    array_agg(DISTINCT t.code) FILTER (WHERE t.taxonomy_system = 'icd10') AS icd10_codes,
+    array_agg(DISTINCT t.code) FILTER (WHERE t.taxonomy_system = 'mesh') AS mesh_codes
 FROM urls u
 JOIN classifications c ON c.url_id = u.id AND c.is_current = TRUE AND c.on_whitelist = TRUE
 LEFT JOIN classification_taxonomy_tags t ON t.classification_id = c.id
 WHERE c.overall_confidence >= 0.7
-GROUP BY u.id, c.id;
+GROUP BY u.id, u.url, u.document_type, c.attribution_entity, 
+         c.overall_confidence, c.audience_type, c.source_type, c.id
+ORDER BY c.overall_confidence DESC;
 
 -- 2. Find near-duplicate content by vector similarity
 SELECT u2.url, 1 - (ce1.embedding <=> ce2.embedding) AS similarity
@@ -1410,6 +1477,11 @@ URL Discovered
      - Insert audit_log entry
      - Schedule next re-scrape (30-day default, 90-day for stable content)
      - Emit event for webhook notification to subscribers
+     - **Trigger incremental CSV/XLSX export** (per RxNetwork output spec):
+       • On batch completion, regenerate export file with columns:
+         URL, source_domain, content_type, detected_medical_categories,
+         detected_entity_associations, confidence_score
+       • Store in R2/S3 for client download
 ```
 
 ---
@@ -1657,7 +1729,8 @@ Cloudflare Workers are a **serverless computing platform** that runs JavaScript/
 - **V8 isolates:** Not containers, not VMs — lightweight V8 engine isolates. Cold start in <5ms (vs. Lambda's 100-500ms)
 - **No server management:** Zero infrastructure. Deploy code, it runs everywhere
 - **Free tier:** 100k requests/day free. Paid: $5/month for 10M requests
-- **Integrations:** D1 (SQL), KV (key-value), R2 (S3-compatible storage), Vectorize (vector DB), Queues, Durable Objects
+- **CPU limit:** Up to 5 minutes CPU time per invocation (not 30ms as sometimes claimed)
+- **Integrations:** D1 (SQLite, limited), KV (key-value), R2 (S3-compatible storage), Queues, Durable Objects
 
 ## How They Relate to RxScope
 
@@ -1696,9 +1769,11 @@ BUT: If they scale it, you could use it for the edge-based dedup/similarity laye
 ```
 
 ### What Workers CANNOT Do for RxScope:
-- **Run the LangGraph pipeline.** Workers have a 30-second CPU time limit. Classification takes longer. Use Fly.io/Railway/VPS for pipeline workers.
+- **Run the LangGraph pipeline.** Workers have compute limits. Classification requires long-running processes. Use dedicated VPS for pipeline workers.
 - **Run scispaCy/BiomedBERT.** Python ML models don't run on Workers (it's primarily JS/TS). Run these on dedicated compute.
-- **Replace PostgreSQL.** D1 is SQLite-based and limited. Use a real PostgreSQL instance (Neon/Supabase).
+- **Replace PostgreSQL.** D1 is SQLite-based (NOT PostgreSQL), max 5GB. Cannot replace Supabase.
+- **Provide biomedical AI.** Workers AI has NO medical classification models — only sentiment analysis (distilbert-sst-2-int8).
+- **Cost-effective vector search.** Vectorize would cost ~$19,200/mo at 50M URLs with 768-dim vectors. Use pgvector instead ($0 extra on Supabase).
 
 ### Architecture with Workers:
 ```
@@ -1760,13 +1835,14 @@ BUT: If they scale it, you could use it for the edge-based dedup/similarity laye
 - **Milestone:** End-to-end pipeline from URL discovery → classification
 
 ## Phase 4: Delivery & HITL (Weeks 14-17)
+- [ ] **Build CSV/XLSX export pipeline (PRIMARY — per RxNetwork spec)**
 - [ ] Build Whitelist API (Cloudflare Worker + Hyperdrive)
 - [ ] Build HITL Review Dashboard (Retool MVP)
 - [ ] Build Re-scrape Scheduler
 - [ ] Build Advertiser Feedback ingestion
-- [ ] Implement CSV/JSON bulk export for DSP import
 - [ ] IAB 3.1 taxonomy mapping validation
-- **Milestone:** Advertisers can consume the whitelist
+- [ ] Validate export output matches client spec: URL, source_domain, content_type, detected_medical_categories, detected_entity_associations, confidence_score
+- **Milestone:** RxNetwork can receive Excel-compatible whitelist
 
 ## Phase 5: Scale & Harden (Weeks 18-22)
 - [ ] Scale to target URL volume (10M+)
@@ -1803,27 +1879,386 @@ BUT: If they scale it, you could use it for the edge-based dedup/similarity laye
 | MeSH | `https://id.nlm.nih.gov/mesh/` | None | Unspecified | Free |
 | Claude API | `https://api.anthropic.com/v1/` | API key | Per plan | $3/MTok input (Sonnet) |
 
-## Appendix B: Cost Estimation (Monthly at Scale)
+## Appendix B: Cost Estimation (Monthly — By Scale)
 
-| Item | Estimated Monthly Cost |
-|------|----------------------|
-| Claude Sonnet API (10M classifications/month) | $15,000 - $45,000 |
-| Claude Opus (5% of URLs for edge cases) | $3,000 - $10,000 |
-| PostgreSQL (Neon/Supabase, 500GB) | $100 - $300 |
-| Redis (Upstash or managed) | $50 - $200 |
-| Cloudflare Workers (Whitelist API) | $5 - $50 |
-| Cloudflare R2 (1TB stored content) | $15 |
-| Fly.io (Pipeline workers, 2-4 instances) | $100 - $400 |
-| Residential Proxies (BrightData) | $500 - $2,000 |
+Cost varies dramatically based on URL volume. Here are three realistic scenarios:
+
+### Scenario 1: Small Scale (100K URLs)
+
+| Item | Monthly Cost |
+|------|-------------|
+| Supabase Pro (PostgreSQL + pgvector, Mumbai) | $25 |
+| Claude Sonnet API (100K classifications) | $50 - $100 |
+| Lightpanda (self-hosted VPS, 2 vCPU) | $20 |
+| Redis (Upstash free tier) | $0 |
+| Cloudflare Workers (Whitelist API) | $5 |
+| Cloudflare R2 (storage, <10GB) | $0 |
+| LangSmith (Developer plan, <5K traces) | $0 |
+| Proxy/rotating IPs (BrightData) | $50 - $100 |
+| BiomedBERT embedding inference | $20 - $50 |
+| **Total** | **$170 - $300/month** |
+
+### Scenario 2: Medium Scale (1M URLs)
+
+| Item | Monthly Cost |
+|------|-------------|
+| Supabase Pro (Small compute add-on) | $40 |
+| Claude Sonnet API (1M classifications) | $400 - $800 |
+| Claude Opus (5% edge cases) | $100 - $200 |
+| Lightpanda (2x VPS, 4 vCPU each) | $80 |
+| Redis (Upstash Pro) | $10 |
+| Cloudflare Workers (Whitelist API) | $5 |
+| Cloudflare R2 (storage, ~50GB) | $5 |
+| LangSmith (Plus plan, ~50K traces) | $164 |
+| Proxy/rotating IPs (BrightData) | $100 - $200 |
+| BiomedBERT embedding inference (GPU) | $100 - $200 |
+| Admin Dashboard hosting (CF Pages) | $0 |
+| **Total** | **$1,004 - $1,704/month** |
+
+### Scenario 3: Large Scale (50M URLs)
+
+| Item | Monthly Cost |
+|------|-------------|
+| Supabase Pro (XL compute add-on, 500GB) | $275 - $400 |
+| Claude Sonnet API (50M classifications, batch mode) | $7,500 - $15,000 |
+| Claude Opus (5% edge cases) | $3,000 - $10,000 |
+| Lightpanda (4x VPS, 8 vCPU each) | $200 - $500 |
+| Redis (Upstash Enterprise) | $50 - $100 |
+| Cloudflare Workers (Whitelist API) | $5 - $45 |
+| Cloudflare R2 (storage, ~1TB) | $15 - $75 |
+| LangSmith (Enterprise, custom) | $300 - $500 |
+| Proxy/rotating IPs (BrightData) | $500 - $1,000 |
 | BiomedBERT embedding inference (GPU) | $200 - $800 |
-| **Total** | **$19,000 - $59,000/month** |
+| Admin Dashboard hosting (CF Pages) | $0 |
+| **Total** | **$12,045 - $28,420/month** |
 
-**The Claude API is the dominant cost.** Reduce it with:
-1. Pre-filter: keyword/heuristic filter eliminates 60-70% of non-medical URLs before Claude
-2. Batch API: Use Claude batch mode for non-urgent classification (50% price reduction)
-3. Caching: If URL content hasn't changed on re-scrape, don't reclassify
-4. Local model: Fine-tune Llama/Mistral on your labeled data for cheap first-pass classification, use Claude only for uncertain cases
+### Cost Reduction Strategies
+
+1. **Pre-filter:** Keyword/heuristic filter eliminates 60-70% of non-medical URLs before Claude → saves 60-70% of API cost
+2. **Batch API:** Use Claude batch mode for non-urgent classification (50% price reduction)
+3. **Caching:** If URL content hasn't changed on re-scrape, don't reclassify
+4. **Local model:** Fine-tune Llama/Mistral on labeled data for cheap first-pass classification, use Claude only for uncertain cases
+5. **Smart escalation:** Use Sonnet for 95% of URLs, Opus only for 0.6-0.8 confidence range
+
+**The Claude API is the dominant cost at scale.** At small scale (100K URLs), total infrastructure is very affordable at $170-300/month.
 
 ---
 
-*End of Architecture Document — RxScope v0.1.0-draft*
+# 11. TECHNOLOGY STACK DECISIONS
+
+## 11.1 LangGraph vs LangSmith — They Are DIFFERENT Products
+
+**These are NOT the same thing.** Both are made by LangChain, Inc. but serve completely different purposes:
+
+| | LangGraph | LangSmith |
+|---|---|---|
+| **What it is** | Open-source agent orchestration framework | Observability & debugging SaaS platform |
+| **Purpose** | Build the AI pipeline — state machines, multi-agent workflows, HITL | Monitor, trace, evaluate, and debug the pipeline in production |
+| **Cost** | **$0 — FREE forever** (MIT-licensed open-source library) | Free: 5K traces/mo. Plus: $39/seat/mo + $2.50/1K traces |
+| **Where it runs** | In your code (Python package) | Cloud SaaS at smith.langchain.com |
+| **Analogy** | The **engine** of the car | The **dashboard/speedometer** of the car |
+
+**RxScope uses BOTH:**
+- **LangGraph** = orchestrates the classification pipeline (scrape → extract → classify → score → store)
+- **LangSmith** = monitors it in production (trace failures, see token costs, debug misclassifications, measure accuracy)
+
+### LangSmith Pricing for RxScope
+
+| Plan | Cost | Traces Included | Our Use Case |
+|------|------|----------------|---------------|
+| Developer | $0/mo | 5K base traces | Enough for development & testing |
+| Plus | $39/seat/mo | 10K base traces, then $2.50/1K | Production at 100K-1M URLs |
+| Enterprise | Custom | Custom | 50M+ URL scale |
+
+**Base trace retention:** 14 days ($2.50/1K). **Extended traces:** 400 days ($5.00/1K).
+
+## 11.2 Database Hosting Decision: Supabase Pro (PostgreSQL)
+
+### Why PostgreSQL (Not MongoDB)
+
+MongoDB was considered and rejected. Here's why:
+
+| Factor | PostgreSQL + pgvector | MongoDB |
+|---|---|---|
+| Vector search (embeddings) | Native `pgvector` — single DB for everything | Separate Atlas Vector Search — limited, expensive |
+| Relational data (URLs, scores, entities, whitelists) | Built for this | No JOINs, denormalized documents |
+| ACID compliance (no duplicate URLs, consistent scores) | Full ACID | Limited multi-doc transactions |
+| Medical NLP data (UMLS codes, entity relationships) | Foreign keys, normalized schema | Embedded references (messy) |
+| SQL exports (client wants CSV/XLSX) | Native SQL → `COPY TO` CSV | Aggregation pipelines (complex) |
+| LangGraph support | First-class PostgreSQL checkpointer | No official checkpointer |
+
+### Why Supabase (Not Neon, Not AWS RDS)
+
+| Provider | Plan | Monthly Cost | pgvector | India Region | Key Feature |
+|---|---|---|---|---|---|
+| **Supabase** ✅ | Pro | **$25/mo** + compute | Built-in | **Mumbai (ap-south-1)** | Dashboard, Auth, Edge Functions, PgBouncer |
+| Neon | Launch | ~$15/mo | Yes | No Mumbai (Singapore) | Serverless scale-to-zero |
+| AWS RDS | db.t4g.micro | ~$15/mo | Manual setup | Mumbai | Raw PG, no extras |
+
+**Supabase Pro selected because:**
+1. **Mumbai region** — lowest latency for India-based operations and data residency
+2. **pgvector built-in** — no manual extension setup
+3. **Built-in dashboard** — DB monitoring out of the box
+4. **Connection pooling** (PgBouncer) — handles Cloudflare Workers connections
+5. **$10/mo compute credit** — first project effectively included
+6. **8GB disk included** in Pro plan — enough for initial 1M+ URLs
+7. **NOT blocked in India** — fully accessible, Mumbai data center
+
+### Supabase Pricing Breakdown
+
+| Item | Free Plan | Pro Plan ($25/mo) |
+|---|---|---|
+| Database size | 500MB | 8GB disk included, then $0.125/GB |
+| Egress | 5GB | 250GB included, then $0.09/GB |
+| Storage | 1GB | 100GB included |
+| Edge Functions | 500K invocations | 2M included |
+| Compute | Nano (shared) | Micro (~$10/mo, covered by credit) |
+| Auth MAU | 50K | 100K included |
+
+**Compute add-ons** (for scaling):
+
+| Size | Monthly Cost | vCPU | RAM |
+|---|---|---|---|
+| Micro | ~$10 | Shared | 1GB |
+| Small | ~$15 | 2 | 2GB |
+| Medium | ~$60 | 2 | 4GB |
+| Large | ~$110 | 2 | 8GB |
+| XL | ~$210 | 4 | 16GB |
+| 2XL | ~$410 | 8 | 32GB |
+
+## 11.3 Cloudflare Services — What We USE vs DON'T USE
+
+Based on deep research of actual Cloudflare pricing and capabilities:
+
+| Service | Decision | Reason |
+|---|---|---|
+| **Workers** (Whitelist API) | ✅ USE | $5/mo for 10M requests. Perfect for edge API. |
+| **R2** (Object Storage) | ✅ USE | $0.015/GB, ZERO egress fees. Perfect for archival. |
+| **Hyperdrive** (PG pooler) | ✅ USE | Free on paid plan. Pools connections to Supabase. |
+| **Pages** (Dashboard hosting) | ✅ USE | Free for static sites. Host the admin dashboard. |
+| Browser Rendering | ❌ DON'T USE | $0.09/hr + $2/concurrent browser. Lightpanda is 50x cheaper. |
+| Workers AI | ❌ DON'T USE | No biomedical classification models. Only sentiment analysis. |
+| D1 | ❌ DON'T USE | SQLite-based, cannot replace PostgreSQL + pgvector. |
+| Vectorize | ❌ DON'T USE | $19,200/mo at 50M URLs with 768-dim vectors. Prohibitive. |
+
+## 11.4 Complete Technology Stack Summary
+
+| Layer | Technology | Cost |
+|---|---|---|
+| **Orchestration** | LangGraph (open-source, MIT) | $0 |
+| **Monitoring** | LangSmith (SaaS) | $0-164/mo |
+| **LLM** | Claude Sonnet 4 (volume) + Opus 4 (edge cases) | Usage-based |
+| **Database** | Supabase Pro (PostgreSQL 16 + pgvector, Mumbai) | $25/mo + compute |
+| **Caching/Queues** | Upstash Redis (serverless) | $0-100/mo |
+| **Scraping** | Lightpanda (self-hosted) + Playwright fallback | VPS cost |
+| **NLP** | scispaCy + MedSpaCy + BiomedBERT | Self-hosted |
+| **API** | Cloudflare Workers + Hyperdrive | $5/mo |
+| **Storage** | Cloudflare R2 | $0-75/mo |
+| **Dashboard** | Next.js on Cloudflare Pages | $0 |
+| **Proxies** | BrightData residential rotating | $50-1,000/mo |
+| **External APIs** | NPI, RxNorm, FDA, UMLS, MeSH | All FREE |
+
+---
+
+# 12. ADMIN DASHBOARD SPECIFICATION
+
+RxNetwork (and future clients) need a web-based dashboard to monitor the system, view results, and export data.
+
+## 12.1 Dashboard Pages
+
+### Page 1: Overview / Home
+- **Total URLs processed** (with daily/weekly trend chart)
+- **Whitelist count** (approved HCP URLs)
+- **Classification breakdown** (pie chart: approved / rejected / pending review / failed)
+- **Confidence distribution** (histogram: 0-0.6, 0.6-0.8, 0.8-1.0)
+- **Top platforms** (bar chart: URLs per source domain)
+- **Processing queue status** (pending / in-progress / completed / failed)
+- **System health** (pipeline uptime, last run timestamp, error rate)
+
+### Page 2: Whitelist Explorer
+- **Searchable, filterable table** of approved URLs
+- Filters: confidence score range, platform, content type, medical category, entity type, date range
+- Column sorting on all fields
+- Inline preview: click URL to see classification details
+- **Export button** → download CSV/XLSX (matches Section 2.3 spec)
+- Pagination for large datasets
+
+### Page 3: Classification Details
+- Per-URL detail view
+- Shows: extracted text (truncated), detected entities, MeSH codes, IAB codes, confidence breakdown
+- Entity association list with NPI verification status
+- Drug name resolution chain (e.g., "Humira" → adalimumab → NDC codes)
+- Audit trail: pipeline run ID, timestamps, version
+
+### Page 4: HITL Review Queue
+- URLs with confidence 0.6-0.8 requiring human review
+- One-click approve / reject / reclassify
+- Override reason field (stored for audit)
+- Queue stats: pending reviews, average review time, reviewer performance
+
+### Page 5: Entity Browser
+- Browse detected entities by category:
+  - Pharmaceutical manufacturers
+  - Medical schools & academic medical centers
+  - Medical trade associations
+  - Recognized physicians (NPI-verified)
+  - Healthcare executives
+  - Biotech companies
+  - Medical device manufacturers
+  - Prominent medical institutions
+- Click entity → see all associated URLs
+
+### Page 6: Analytics & Reports
+- Classification accuracy over time (if HITL labels available)
+- Cost tracking: Claude API spend per day/week/month
+- Processing speed: URLs/hour, latency per pipeline stage
+- Re-scrape results: content change rate, reclassification rate
+- Exportable reports (PDF/CSV)
+
+### Page 7: Settings & Configuration
+- Confidence thresholds (adjustable)
+- Platform management (add/remove target domains)
+- Re-scrape schedule configuration
+- API key management (for Whitelist API)
+- User management (admin roles)
+
+## 12.2 Dashboard Technology
+
+| Component | Technology | Hosting |
+|---|---|---|
+| Frontend | Next.js 14+ (App Router) | Cloudflare Pages ($0) |
+| Auth | Supabase Auth (built-in) | Included in Supabase Pro |
+| API layer | Supabase PostgREST (auto-generated) + Edge Functions | Included |
+| Charts | Recharts or Tremor | Bundled |
+| Export | Server-side CSV/XLSX generation | Edge Function |
+| Real-time | Supabase Realtime (live processing updates) | Included |
+
+**Cost:** $0 additional — dashboard uses existing Supabase infrastructure.
+
+---
+
+# 13. INFRASTRUCTURE & COST BREAKDOWN (CLIENT-FACING)
+
+This section is structured for client presentation.
+
+## 13.1 One-Time Development Cost
+
+| Phase | Deliverable | Duration |
+|---|---|---|
+| Phase 0 | Infrastructure setup, DB schema, evaluation dataset | 1-2 weeks |
+| Phase 1 | Scraping pipeline (Lightpanda + content extraction) | 2-3 weeks |
+| Phase 2 | Classification pipeline (LangGraph + Claude + scispaCy) | 3-4 weeks |
+| Phase 3 | Entity resolution (RxNorm, NPI, UMLS integration) | 2-3 weeks |
+| Phase 4 | Admin dashboard + CSV/XLSX export system | 1-2 weeks |
+| Phase 5 | HITL review system + accuracy tuning | 2-3 weeks |
+| Phase 6 | Testing, deployment, security audit, documentation | 1-2 weeks |
+| **Total** | **Complete RxScope System** | **12-19 weeks** |
+
+## 13.2 Monthly Recurring Infrastructure Costs (Client Pays)
+
+| Service | Small (100K URLs) | Medium (1M URLs) | Large (50M URLs) |
+|---|---|---|---|
+| Database (Supabase Pro) | $25 | $40 | $275-400 |
+| AI Classification (Claude API) | $50-100 | $500-1,000 | $10,500-25,000 |
+| Scraping Infrastructure (VPS) | $20 | $80 | $200-500 |
+| Cache & Queues (Upstash Redis) | $0 | $10 | $50-100 |
+| API & CDN (Cloudflare) | $5 | $5 | $5-45 |
+| Storage (Cloudflare R2) | $0 | $5 | $15-75 |
+| Monitoring (LangSmith) | $0 | $164 | $300-500 |
+| Proxies (BrightData) | $50-100 | $100-200 | $500-1,000 |
+| ML Inference (BiomedBERT) | $20-50 | $100-200 | $200-800 |
+| **Monthly Total** | **$170-300** | **$1,004-1,704** | **$12,045-28,420** |
+
+> **Note:** The dominant cost at large scale is Claude API usage. This can be reduced 50-70% with pre-filtering heuristics and batch API pricing.
+
+## 13.3 What the Client Gets
+
+1. **AI-powered medical content classification system** — automated identification of HCP-oriented content
+2. **Deduplicated URL whitelist** in Excel-compatible format (CSV/XLSX) with full metadata
+3. **Admin dashboard** — real-time monitoring, search, export, and HITL review
+4. **REST API** — programmatic access to whitelists for DSP integration
+5. **Entity verification** — NPI-verified physicians, FDA-validated drugs, verified institutions
+6. **Multi-taxonomy mapping** — IAB 3.1, MeSH, ICD-10, DSM-5, RxNorm
+7. **Ongoing re-validation** — scheduled re-scraping ensures URLs remain current
+8. **Full audit trail** — every classification decision is traceable
+
+---
+
+# 14. CLIENT COMMUNICATION GUIDE
+
+## 14.1 Questions to Ask the Client Before Quoting
+
+### Must-Ask (Affects Scope & Cost)
+
+1. **"How many URLs do you need classified in the first batch?"**
+   - 10K, 100K, 1M, 50M? This is the single biggest cost driver.
+
+2. **"How often do you need re-classification?"**
+   - One-time batch? Daily/weekly/monthly refresh? Affects recurring costs.
+
+3. **"Do you need a dashboard/admin panel, or just CSV/XLSX exports?"**
+   - Dashboard adds development time but provides ongoing value.
+
+4. **"Who provides the seed URL list?"**
+   - Does the client give URLs to classify? Or do we discover URLs by crawling?
+
+5. **"What's the expected turnaround time?"**
+   - "1M URLs in 24 hours" vs "1 week is fine" — affects concurrency and cost.
+
+6. **"Is this a one-time batch job, or a continuously running system?"**
+   - SaaS product vs batch processing — very different architectures.
+
+7. **"Which platforms are MANDATORY for Phase 1 launch?"**
+   - PubMed/WebMD/Healthline = easy. Scribd/SlideShare = access challenges.
+
+8. **"Do you need API access to the whitelist, or just file exports?"**
+   - API = Cloudflare Workers ($5/mo). File only = simpler.
+
+9. **"Is there a specific DSP this connects to?"**
+   - Determines output format requirements (IAB taxonomy version, OpenRTB fields).
+
+10. **"What's your budget range?"**
+    - Prevents over-building or under-quoting.
+
+## 14.2 Things to Make the Client Aware Of
+
+### Honest Technical Realities
+
+1. **Scribd/SlideShare content access is limited**
+   - Scribd has NO API since 2017. Only metadata scraping is possible without a user account. Recommend as Phase 2, not Phase 1.
+
+2. **Claude API costs scale with volume**
+   - At 50M URLs: $7,500-$25,000/month in API costs alone. At 100K URLs: $50-100/month. Volume agreement matters.
+
+3. **Classification accuracy won't be 100% from day one**
+   - Expect 85-90% accuracy initially, improving to 95%+ after HITL feedback loops. There's a ramp-up period of 2-4 weeks.
+
+4. **robots.txt compliance means some sites limit scraping rate**
+   - Sites like WebMD may restrict automated access. We respect this for legal protection.
+
+5. **The system needs ongoing maintenance**
+   - Medical content changes constantly. New drugs, new guidelines, new HCPs. Whitelists need periodic refreshing.
+
+6. **Infrastructure costs are SEPARATE from development costs**
+   - Quote should clearly split: development (one-time) vs hosting (monthly recurring).
+
+7. **Data residency**
+   - Database hosted in Mumbai (India). AI processing calls go to Anthropic (US). If client has data sovereignty requirements, discuss early.
+
+## 14.3 Recommended Phased Delivery
+
+Present to client as milestones with deliverables:
+
+| Milestone | Deliverable | When |
+|---|---|---|
+| **M1: PoC** | Working classifier on 3,000 PubMed URLs + accuracy report | Week 4-5 |
+| **M2: Entity Resolution** | Drug/physician/org verification working on test data | Week 8 |
+| **M3: First Whitelist** | 100K URL whitelist in CSV/XLSX format | Week 11 |
+| **M4: Dashboard** | Admin panel with search, export, and HITL review | Week 14 |
+| **M5: Production** | Full system running at target scale with monitoring | Week 18-22 |
+
+Each milestone is a **client demo point** — they see progress, can give feedback, and confirm direction before additional investment.
+
+---
+
+*End of Architecture Document — RxScope v0.2.0-draft*
