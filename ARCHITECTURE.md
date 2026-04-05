@@ -1,9 +1,18 @@
 # RxScope — Pre-Build Architecture Document
 
-**Version:** 0.1.0-draft  
+**Version:** 0.1.1-draft  
 **Date:** April 5, 2026  
 **Author:** Architecture Review  
+**Client:** RxNetwork  
 **Classification:** Confidential (Post-NDA)
+
+> **RxNetwork Brief:** *"AI-Based Medical Content Identification System"* — Develop an AI-driven classification system to identify medically relevant, HCP-oriented content across large document-hosting and UGC platforms, **including but not limited to** Scribd.com and Slideshare.net, for use as a pharmaceutical ad-targeting whitelist.
+>
+> **Target Entity Categories (per client):** Pharmaceutical manufacturers · Medical schools & academic medical centers · Medical trade associations · Recognized physicians · Healthcare executives · Biotech companies · Medical device manufacturers · Prominent medical institutions
+>
+> **Required Training Taxonomies (per client):** MeSH · Medical condition hierarchies · FDA drug name databases · ICD-10 · DSM-5
+>
+> **Required Output (per client):** Deduplicated URL list in Excel-compatible format (CSV/XLSX) with metadata: source domain, content type, detected medical categories, detected entity associations, confidence score
 
 ---
 
@@ -278,7 +287,7 @@ This is transmitted to DSPs via deal-level metadata or custom key-value pairs in
 
 **MITIGATION strategies:**
 - **Best:** Negotiate a data partnership/licensing deal with Scribd Inc. They have advertising partners (per their privacy policy) — position RxScope as adding value to their ad inventory.
-- **Good:** Limit scraping to publicly accessible pages only. Respect robots.txt. Use Lightpanda's `--obey_robots` flag.
+- **Good:** Limit scraping to publicly accessible pages only. Respect robots.txt. Use Lightpanda's `--obey-robots` flag.
 - **Acceptable:** Scrape only metadata (title, author, description) available without login. Use this metadata + ML to classify without full content extraction.
 - **Also consider:** Common Crawl / WARC archives may contain cached Scribd/Slideshare pages from earlier crawls. These are legally clean to analyze.
 
@@ -400,7 +409,7 @@ Redis is NOT a database here. Use it for:
 │  │  ┌──────────────────┐   ┌────────────────────────┐  │         │
 │  │  │  Lightpanda       │   │  Playwright (fallback) │  │         │
 │  │  │  (Primary, Zig)   │   │  Chrome, JS-heavy      │  │         │
-│  │  │  --obey_robots    │   │  pages                  │  │         │
+│  │  │  --obey-robots    │   │  pages                  │  │         │
 │  │  └────────┬─────────┘   └──────────┬─────────────┘  │         │
 │  │           └──────────┬─────────────┘                 │         │
 │  │                      ▼                               │         │
@@ -517,17 +526,88 @@ Redis is NOT a database here. Use it for:
 
 | Component | Responsibility | Technology |
 |-----------|---------------|------------|
-| Sitemap Discoverer | Parse sitemap.xml for Scribd/Slideshare, discover crawlable URLs | Python, `lxml` |
+| Sitemap Discoverer | Parse sitemap.xml for target platforms (Scribd, Slideshare, and future sources), discover crawlable URLs | Python, `lxml` |
 | URL Queue | Priority-based job scheduling, rate limiting per domain | Redis + BullMQ |
-| Scraping Engine | Fetch page content, handle JS rendering, obey robots.txt | Lightpanda (primary), Playwright (fallback) |
+| Scraping Engine | Fetch page content, handle JS rendering, obey robots.txt. **Lightpanda** (Zig-based, 27k+ stars, CDP-compatible, 9x less memory & 11x faster than Chrome, `--obey-robots` built-in, Docker image available, AGPL-3.0). Playwright+Chrome fallback for edge cases. | Lightpanda (primary), Playwright (fallback) |
 | Proxy Pool | Rotate residential IPs, avoid rate limits | BrightData / Oxylabs API |
 | LangGraph Pipeline | Multi-agent content classification pipeline | LangGraph + Claude API |
 | PostgreSQL | Relational data + vector embeddings | PostgreSQL 16 + pgvector 0.8.2 |
 | Redis | Job queues, caching, rate limiting | Redis 7+ |
 | Object Storage | Raw content archival | Cloudflare R2 or AWS S3 |
 | Whitelist API | Serve classified URLs to ad-tech buyers | FastAPI or Cloudflare Workers |
+| **CSV/XLSX Exporter** | **Primary delivery: Excel-compatible export per client spec** | **Python (openpyxl / pandas)** |
 | HITL Dashboard | Review low-confidence classifications | React/Next.js |
 | Re-scrape Scheduler | Periodic re-validation of classified URLs | pg_cron or APScheduler |
+
+## 2.3 Output Specification (Per Client Requirements)
+
+RxNetwork's primary deliverable is an **Excel-compatible file (CSV or XLSX)** containing a deduplicated list of validated HCP-content URLs with metadata.
+
+### Required Output Columns (from client email)
+
+| Column | Description | Source |
+|--------|-------------|--------|
+| `url` | Deduplicated URL validated as HCP content | urls table |
+| `source_domain` | Platform domain (e.g., scribd.com, slideshare.net) | Extracted from URL |
+| `content_type` | PDF, PPT, text, white paper, clinical summary, research poster, educational material | Extractor Agent |
+| `detected_medical_categories` | MeSH codes + IAB categories (semicolon-separated) | Classifier Agent |
+| `detected_entity_associations` | Attributed entities: org names, physician names, drug names | Entity Resolver Agent |
+| `confidence_score` | Overall classification confidence (0.00–1.00) | Confidence Scorer |
+
+### Optional Extended Columns (recommended)
+
+| Column | Description |
+|--------|-------------|
+| `audience_type` | HCP / CONSUMER / MIXED / UNKNOWN |
+| `source_type` | pharma_manufacturer, medical_school, trade_association, recognized_physician, healthcare_executive, biotech, device_manufacturer, medical_institution |
+| `iab_category_codes` | IAB 3.1 category codes for DSP ingestion |
+| `icd10_codes` | Detected ICD-10 diagnostic codes |
+| `dsm5_categories` | Detected DSM-5 diagnostic categories |
+| `fda_drug_names` | Detected FDA-listed drug names |
+| `mesh_codes` | MeSH descriptor codes |
+| `attribution_entity` | Primary attributed institution/author |
+| `last_validated_at` | Timestamp of most recent URL validation |
+
+### Export Implementation
+
+```python
+# Primary export: CSV/XLSX for RxNetwork
+import pandas as pd
+
+def export_whitelist(db_conn, format="xlsx"):
+    query = """
+    SELECT 
+        u.url,
+        split_part(u.url, '/', 3) AS source_domain,
+        u.document_type AS content_type,
+        string_agg(DISTINCT m.mesh_code, '; ') AS detected_medical_categories,
+        c.attribution_entity AS detected_entity_associations,
+        c.overall_confidence AS confidence_score,
+        c.audience_type,
+        c.source_type
+    FROM urls u
+    JOIN classifications c ON c.url_id = u.id AND c.is_current = TRUE AND c.on_whitelist = TRUE
+    LEFT JOIN classification_taxonomy_tags t ON t.classification_id = c.id
+    LEFT JOIN mesh_terms m ON m.id = t.mesh_term_id
+    GROUP BY u.url, u.document_type, c.attribution_entity, 
+             c.overall_confidence, c.audience_type, c.source_type
+    ORDER BY c.overall_confidence DESC
+    """
+    df = pd.read_sql(query, db_conn)
+    
+    if format == "xlsx":
+        df.to_excel("rxscope_whitelist.xlsx", index=False, engine="openpyxl")
+    else:
+        df.to_csv("rxscope_whitelist.csv", index=False)
+```
+
+### Business Use Case Alignment (per RxNetwork)
+
+The exported whitelist enables:
+1. **Regulatory-aligned campaign delivery** — only verified HCP content URLs
+2. **Brand-safe placement** — pre-validated against medical taxonomies
+3. **Improved HCP audience precision** — entity-verified healthcare sources
+4. **Reduction of non-medical/consumer-grade inventory exposure** — confidence-scored filtering
 
 ---
 
@@ -667,14 +747,14 @@ class RxScopeState(TypedDict):
     # Input
     url: str
     raw_html: str
-    source_platform: Literal["scribd", "slideshare"]
+    source_platform: Literal["scribd", "slideshare", "pubmed", "other"]  # extensible per client scope
     
     # Extractor output
     clean_text: str
     title: str
     author: str
     author_credentials: Optional[str]
-    document_type: str  # "presentation", "paper", "report", "article"
+    document_type: str  # "pdf", "ppt", "text", "white_paper", "clinical_summary", "research_poster", "educational_material"
     language: str
     word_count: int
     metadata: dict
@@ -690,9 +770,15 @@ class RxScopeState(TypedDict):
     iab_categories: list[str]
     hcp_signal: float  # 0-1, probability content is HCP-targeted
     content_source_type: Literal[
-        "pharma_manufacturer", "medical_school", "trade_association",
-        "licensed_physician", "healthcare_executive", "biotech",
-        "device_manufacturer", "medical_institution", "unknown"
+        "pharma_manufacturer",       # Pharmaceutical manufacturers
+        "medical_school",            # Medical schools and academic medical centers
+        "trade_association",         # Medical trade associations
+        "recognized_physician",      # Recognized physicians
+        "healthcare_executive",      # Healthcare executives
+        "biotech",                   # Biotech companies
+        "device_manufacturer",       # Medical device manufacturers
+        "medical_institution",       # Prominent medical institutions
+        "unknown"
     ]
     detected_entities: list[dict]  # {text, type, start, end, cui}
     
@@ -784,12 +870,14 @@ app = graph.compile(checkpointer=checkpointer, interrupt_before=["hitl_queue"])
 ```
 Input:  raw_html (string), url (string)
 Does:   
-  1. Detect content type (HTML page, embedded PDF, slide images)
+  1. Detect content type (per client spec: PDF, PPT/slide deck, white paper,
+     clinical summary, research poster, educational material, plain text)
   2. For HTML: BeautifulSoup → clean text, extract title/author/metadata
   3. For PDF: PyMuPDF (fitz) → extract text, fallback to Tesseract OCR
   4. For slides: Extract slide text from Slideshare DOM; fallback OCR
-  5. Detect language (langdetect/fasttext)
-  6. Extract author credentials from page context
+  5. For research posters/images: OCR with Tesseract/PaddleOCR
+  6. Detect language (langdetect/fasttext)
+  7. Extract author credentials from page context
 Output: clean_text, title, author, document_type, language, metadata
 ```
 
@@ -876,7 +964,7 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE TABLE urls (
     id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     url             TEXT NOT NULL UNIQUE,
-    platform        VARCHAR(20) NOT NULL CHECK (platform IN ('scribd', 'slideshare')),
+    platform        VARCHAR(50) NOT NULL,  -- 'scribd', 'slideshare', 'pubmed', etc. (extensible per client: "including but not limited to")
     discovered_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_scraped_at TIMESTAMPTZ,
     last_classified_at TIMESTAMPTZ,
@@ -894,7 +982,7 @@ CREATE TABLE urls (
     author_url      TEXT,
     language        VARCHAR(10),
     word_count      INTEGER,
-    document_type   VARCHAR(30),
+    document_type   VARCHAR(30),  -- pdf, ppt, text, white_paper, clinical_summary, research_poster, educational_material
     page_description TEXT,
     
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -1204,7 +1292,7 @@ URL Discovered
      ▼
 [2] SCRAPE
      - Queue job in BullMQ with rate limiting (max 2 req/sec per domain)
-     - Lightpanda fetches page (--obey_robots, CDP protocol)
+     - Lightpanda fetches page (--obey-robots, CDP protocol)
      - If Lightpanda fails (JS-heavy page) → retry with Playwright + Chrome
      - Store raw HTML in Object Storage (S3/R2) with URL as key
      - Extract HTTP status, store in urls table
@@ -1212,11 +1300,15 @@ URL Discovered
      │
      ▼
 [3] CONTENT EXTRACTION (Extractor Agent)
-     - Detect content type:
+     - Detect content type (per RxNetwork client spec):
+       • PDF → PyMuPDF text extraction
+       • Slide deck (PPT) → extract slide text from DOM spans
+       • White paper → PDF/HTML extraction, section-aware parsing
+       • Clinical summary → structured text extraction
+       • Research poster → OCR with Tesseract/PaddleOCR
+       • Educational material → multi-format extraction
        • HTML page with embedded document viewer → extract from viewer DOM
-       • PDF (direct link) → PyMuPDF text extraction
-       • Slide deck (Slideshare) → extract slide text from DOM spans
-       • Image-based slides → OCR with Tesseract/PaddleOCR
+       • Image-based content → OCR fallback
      - Normalize text: strip boilerplate, navigation, ads
      - Extract metadata: title, author, publication date, description
      - Detect language (fasttext model)
@@ -1434,7 +1526,7 @@ Match incoming text against canonical names with trigram similarity:
 |---|----------|--------|------------|
 | 1 | **No legal content access strategy** | Scraping Scribd behind paywall = lawsuit risk. No API exists. | Negotiate data partnership with Scribd Inc. OR pivot to publicly accessible medical content platforms (PubMed, preprint servers, open-access journals). |
 | 2 | **No evaluation dataset** | Cannot measure if classifier works. Cannot quote accuracy to advertisers. Cannot improve. | Build 3,000-5,000 labeled URL gold standard BEFORE building pipeline. Budget 2-3 weeks. |
-| 3 | **Advertiser delivery mechanism undefined** | Whitelist is useless if DSPs can't consume it. "What format? What protocol?" | Define output spec: Prebid segment? Custom deal ID mapping? CSV bulk upload? API endpoint? Talk to 2-3 target DSP/SSP partners BEFORE building. |
+| 3 | **Advertiser delivery mechanism undefined** | Whitelist is useless if DSPs can't consume it. | **PARTIALLY RESOLVED:** Client specifies CSV/XLSX as primary output (see Section 2.3). Still need to confirm: scheduled delivery cadence? Automated push? Manual handoff? Also confirm if real-time API needed for RTB or if batch export suffices. |
 | 4 | **Claude API cost at scale** | 10M URLs × $0.003-$0.015 per classification = $30K-$150K per full pass. Re-runs compound cost. | Implement tiered classification: cheap heuristic filter first (eliminate 70% of non-medical content), only send plausible medical content to Claude. |
 
 ## Priority 2: REGULATORY RISK
