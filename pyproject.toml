@@ -1,0 +1,69 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rxscope"
+version = "0.1.0"
+description = "AI-Based Medical Content Identification System for pharma ad-targeting"
+requires-python = ">=3.12"
+dependencies = [
+    # AI & LLM
+    "langgraph>=0.4,<1",
+    "langgraph-checkpoint-postgres>=2,<3",
+    "langchain-anthropic>=0.3,<1",
+    "langsmith>=0.3,<1",
+
+    # Database (pure-Python driver — no C build needed)
+    "psycopg>=3.2,<4",
+    "psycopg-pool>=3.2,<4",
+
+    # Web scraping
+    "beautifulsoup4>=4.12,<5",
+    "httpx>=0.28,<1",
+
+    # Data processing & export
+    "pandas>=2.2,<3",
+    "openpyxl>=3.1,<4",
+
+    # Utilities
+    "pydantic>=2.9,<3",
+    "pydantic-settings>=2.6,<3",
+    "redis>=5.2,<6",
+    "click>=8.1,<9",
+    "structlog>=24,<26",
+    "tenacity>=9,<10",
+    "python-dotenv>=1,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<9",
+    "pytest-asyncio>=0.24,<1",
+    "ruff>=0.8,<1",
+]
+nlp = [
+    "scispacy>=0.5",
+    "medspacy>=1",
+    "spacy>=3.7,<4",
+]
+ocr = [
+    "pymupdf>=1.24,<2",
+]
+
+[project.scripts]
+rxscope = "rxscope.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rxscope"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
