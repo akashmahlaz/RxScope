@@ -1,6 +1,7 @@
 # Complete Prompt for Google AI — RxScope Client Presentation
 
 Copy everything below this line and paste into Google Gemini / Google AI:
+c:\Users\akash\work\rxscope\.venv\Scripts\Activate.ps1
 
 ---
 

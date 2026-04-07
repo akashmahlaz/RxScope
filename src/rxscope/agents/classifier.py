@@ -1,4 +1,4 @@
-"""Classifier agent — Claude Sonnet + scispaCy for medical content classification."""
+"""Classifier agent — MiniMax M2.7 (Anthropic-compatible) for medical content classification."""
 
 from __future__ import annotations
 
@@ -55,7 +55,7 @@ def classifier_agent(state: RxScopeState) -> dict:
     url = state.get("url", "")
     log.info("classifier.start", url=url)
 
-    if not settings.anthropic_api_key:
+    if not settings.minimax_api_key:
         log.warning("classifier.no_api_key", msg="Returning placeholder classification")
         return {
             "mesh_codes": [],
@@ -66,8 +66,9 @@ def classifier_agent(state: RxScopeState) -> dict:
         }
 
     llm = ChatAnthropic(
-        model="claude-sonnet-4-20250514",
-        api_key=settings.anthropic_api_key,
+        model=settings.minimax_model,
+        api_key=settings.minimax_api_key,
+        base_url=settings.minimax_base_url,
         max_tokens=2048,
         temperature=0,
     )

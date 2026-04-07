@@ -10,8 +10,10 @@ class Settings(BaseSettings):
     database_url: str = "postgresql://postgres:password@localhost:5432/rxscope"
     database_pool_size: int = 10
 
-    # Anthropic
-    anthropic_api_key: str = ""
+    # MiniMax (Anthropic-compatible API)
+    minimax_api_key: str = ""
+    minimax_base_url: str = "https://api.minimax.io/anthropic"
+    minimax_model: str = "MiniMax-M2.7"
 
     # Redis
     redis_url: str = "redis://localhost:6379/0"
