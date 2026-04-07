@@ -83,5 +83,6 @@ def build_graph() -> StateGraph:
 def compile_pipeline():
     """Build and compile the pipeline, optionally with checkpointing."""
     graph = build_graph()
-    # Interrupt before hitl_queue so the graph pauses for human input
-    return graph.compile(interrupt_before=["hitl_queue"])
+    # NOTE: interrupt_before=["hitl_queue"] disabled for MVP — all tiers persist to DB.
+    # Re-enable when the dashboard review UI is built.
+    return graph.compile()

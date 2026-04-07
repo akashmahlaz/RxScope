@@ -79,11 +79,41 @@ def classifier_agent(state: RxScopeState) -> dict:
         HumanMessage(content=prompt),
     ])
 
-    # Parse structured JSON response
+    # MiniMax M2.7 returns content blocks (thinking + text) via Anthropic SDK.
+    # Extract the text block containing the JSON.
     import json
 
+    raw = response.content
+    text_content = ""
+    if isinstance(raw, list):
+        # Content blocks: [{"type": "thinking", ...}, {"type": "text", "text": "..."}]
+        for block in raw:
+            if hasattr(block, "type") and block.type == "text":
+                text_content = block.text
+                break
+            elif isinstance(block, dict) and block.get("type") == "text":
+                text_content = block.get("text", "")
+                break
+        if not text_content:
+            # Fallback: grab any string from blocks
+            for block in raw:
+                t = getattr(block, "text", None) or (block.get("text") if isinstance(block, dict) else None)
+                if t:
+                    text_content = t
+                    break
+    elif isinstance(raw, str):
+        text_content = raw
+
+    # Strip markdown fences if model wraps in ```json ... ```
+    text_content = text_content.strip()
+    if text_content.startswith("```"):
+        text_content = text_content.split("\n", 1)[-1]
+    if text_content.endswith("```"):
+        text_content = text_content.rsplit("```", 1)[0]
+    text_content = text_content.strip()
+
     try:
-        result = json.loads(response.content)
+        result = json.loads(text_content)
     except (json.JSONDecodeError, TypeError):
         log.error("classifier.parse_error", url=url, raw=str(response.content)[:500])
         return {
