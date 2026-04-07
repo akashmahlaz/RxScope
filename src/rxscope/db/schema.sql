@@ -1,9 +1,10 @@
 -- RxScope Database Schema v0.1.0
 -- PostgreSQL 16 + pgvector + pg_trgm
 
-CREATE EXTENSION IF NOT EXISTS vector;
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+-- Extensions: gracefully skip if unavailable on managed hosts
+DO $$ BEGIN CREATE EXTENSION IF NOT EXISTS vector; EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'pgvector not available — embedding columns will be unused'; END $$;
+DO $$ BEGIN CREATE EXTENSION IF NOT EXISTS pg_trgm; EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'pg_trgm not available — fuzzy search disabled'; END $$;
+DO $$ BEGIN CREATE EXTENSION IF NOT EXISTS "uuid-ossp"; EXCEPTION WHEN OTHERS THEN RAISE NOTICE 'uuid-ossp not available — use gen_random_uuid() instead'; END $$;
 
 -- ══════════════════════════════════════════
 -- URLS & SCRAPE STATUS
@@ -219,8 +220,7 @@ CREATE TABLE scrape_schedule (
     last_change_detected BOOLEAN
 );
 
-CREATE INDEX idx_scrape_schedule_next ON scrape_schedule(next_scrape_at)
-    WHERE next_scrape_at <= NOW();
+CREATE INDEX idx_scrape_schedule_next ON scrape_schedule(next_scrape_at);
 
 -- ══════════════════════════════════════════
 -- TAXONOMY REFERENCE TABLES

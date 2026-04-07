@@ -47,7 +47,7 @@ def run_schema():
     from pathlib import Path
 
     schema_path = Path(__file__).parent / "schema.sql"
-    sql = schema_path.read_text()
+    sql = schema_path.read_text(encoding="utf-8")
 
     with get_connection() as conn:
         conn.execute(sql)
